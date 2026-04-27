@@ -513,6 +513,8 @@ export class ParallelExecutor {
 
     const pendingTasks = [...group.tasks];
     const inFlightWorkers = new Map<number, Promise<{ slotIndex: number; result: WorkerResult }>>();
+    const launchedPromises: Array<Promise<{ slotIndex: number; result: WorkerResult }>> = [];
+    const taskIdBySlot = new Map<number, string>();
     let groupTasksCompleted = 0;
     let groupTasksFailed = 0;
     let groupMergesCompleted = 0;
@@ -530,7 +532,9 @@ export class ParallelExecutor {
       }
 
       const startedWorker = await this.startWorkerForTask(nextTask, slotIndex);
+      taskIdBySlot.set(slotIndex, nextTask.id);
       inFlightWorkers.set(slotIndex, startedWorker.resultPromise);
+      launchedPromises.push(startedWorker.resultPromise);
       return true;
     };
 
@@ -545,6 +549,15 @@ export class ParallelExecutor {
     while (inFlightWorkers.size > 0) {
       const completed = await Promise.race(inFlightWorkers.values());
       inFlightWorkers.delete(completed.slotIndex);
+
+      const expectedTaskId = taskIdBySlot.get(completed.slotIndex);
+      taskIdBySlot.delete(completed.slotIndex);
+      if (expectedTaskId && completed.result.task.id !== expectedTaskId) {
+        throw new Error(
+          `Worker slot/task mismatch for slot ${completed.slotIndex}: expected ${expectedTaskId}, got ${completed.result.task.id}`
+        );
+      }
+
       this.activeWorkers = this.activeWorkers.filter((w) => w.id !== completed.result.workerId);
       this.worktreeManager.release(`worker-${completed.result.workerId}`);
       this.completedResults.push(completed.result);
@@ -566,6 +579,8 @@ export class ParallelExecutor {
 
       await launchWorkerInSlot(completed.slotIndex);
     }
+
+    await Promise.allSettled(launchedPromises);
 
     this.emitParallel({
       type: 'parallel:group-completed',

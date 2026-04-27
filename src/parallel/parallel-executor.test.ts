@@ -805,6 +805,164 @@ describe('ParallelExecutor class', () => {
       }
     });
 
+    test('executeGroup starts one worker per task in the batch', async () => {
+      const executor = new ParallelExecutor(createMockConfig(), createMockTracker(), {
+        maxWorkers: 8,
+      });
+      const groupTasks = [task('A'), task('B'), task('C')];
+      const group = { index: 0, tasks: groupTasks, depth: 0 };
+
+      (executor as any).taskGraph = {
+        ...createSingleGroupAnalysis(groupTasks[0]),
+        groups: [{
+          index: 0,
+          tasks: groupTasks,
+          depth: 0,
+          maxPriority: 2,
+        }],
+        actionableTaskCount: groupTasks.length,
+        maxParallelism: groupTasks.length,
+      };
+      (executor as any).worktreeManager = { release: () => {} };
+      (executor as any).handleWorkerCompletion = async () => {};
+
+      const startedTaskIds: string[] = [];
+      (executor as any).startWorkerForTask = async (startedTask: TrackerTask, slotIndex: number) => {
+        startedTaskIds.push(startedTask.id);
+        return {
+          resultPromise: Promise.resolve({
+            slotIndex,
+            result: createWorkerResult(startedTask, {
+              workerId: `worker-${startedTask.id}`,
+            }),
+          }),
+        };
+      };
+
+      await (executor as any).executeGroup(group, 0);
+
+      expect(startedTaskIds).toHaveLength(groupTasks.length);
+      expect(new Set(startedTaskIds).size).toBe(groupTasks.length);
+    });
+
+    test('executeGroup settles exactly one worker promise per task', async () => {
+      const executor = new ParallelExecutor(createMockConfig(), createMockTracker(), {
+        maxWorkers: 8,
+      });
+      const groupTasks = [task('A'), task('B'), task('C')];
+      const group = { index: 0, tasks: groupTasks, depth: 0 };
+
+      (executor as any).taskGraph = {
+        ...createSingleGroupAnalysis(groupTasks[0]),
+        groups: [{
+          index: 0,
+          tasks: groupTasks,
+          depth: 0,
+          maxPriority: 2,
+        }],
+        actionableTaskCount: groupTasks.length,
+        maxParallelism: groupTasks.length,
+      };
+      (executor as any).worktreeManager = { release: () => {} };
+      (executor as any).handleWorkerCompletion = async () => {};
+      (executor as any).startWorkerForTask = async (startedTask: TrackerTask, slotIndex: number) => ({
+        resultPromise: Promise.resolve({
+          slotIndex,
+          result: createWorkerResult(startedTask, {
+            workerId: `worker-${startedTask.id}`,
+          }),
+        }),
+      });
+
+      const originalAllSettled = Promise.allSettled;
+      let settledInputLength = -1;
+      (Promise as any).allSettled = ((values: Iterable<unknown>) => {
+        const asArray = Array.from(values);
+        settledInputLength = asArray.length;
+        return originalAllSettled(asArray);
+      }) as typeof Promise.allSettled;
+
+      try {
+        await (executor as any).executeGroup(group, 0);
+      } finally {
+        (Promise as any).allSettled = originalAllSettled;
+      }
+
+      expect(settledInputLength).toBe(groupTasks.length);
+    });
+
+    test('executeGroup keeps failed result mapping tied to the correct task/worker', async () => {
+      const executor = new ParallelExecutor(createMockConfig(), createMockTracker(), {
+        maxWorkers: 2,
+      });
+      const taskA = task('A');
+      const taskB = task('B');
+      const group = { index: 0, tasks: [taskA, taskB], depth: 0 };
+
+      (executor as any).taskGraph = {
+        ...createSingleGroupAnalysis(taskA),
+        groups: [{
+          index: 0,
+          tasks: [taskA, taskB],
+          depth: 0,
+          maxPriority: 2,
+        }],
+        actionableTaskCount: 2,
+        maxParallelism: 2,
+      };
+      (executor as any).worktreeManager = { release: () => {} };
+
+      const completionPairs: Array<{ taskId: string; workerId: string; success: boolean }> = [];
+      (executor as any).handleWorkerCompletion = async (
+        result: WorkerResult,
+        _pendingTasks: TrackerTask[],
+        counters: { incrementTaskCompleted: () => void; incrementTaskFailed: () => void }
+      ) => {
+        completionPairs.push({
+          taskId: result.task.id,
+          workerId: result.workerId,
+          success: result.success,
+        });
+        if (result.success) {
+          counters.incrementTaskCompleted();
+        } else {
+          counters.incrementTaskFailed();
+        }
+      };
+
+      (executor as any).startWorkerForTask = async (startedTask: TrackerTask, slotIndex: number) => {
+        const delayMs = startedTask.id === 'A' ? 15 : 1;
+        const success = startedTask.id !== 'A';
+        return {
+          resultPromise: new Promise((resolve) => {
+            setTimeout(() => {
+              resolve({
+                slotIndex,
+                result: createWorkerResult(startedTask, {
+                  workerId: `worker-${startedTask.id}`,
+                  success,
+                  taskCompleted: success,
+                }),
+              });
+            }, delayMs);
+          }),
+        };
+      };
+
+      await (executor as any).executeGroup(group, 0);
+
+      expect(completionPairs).toContainEqual({
+        taskId: 'A',
+        workerId: 'worker-A',
+        success: false,
+      });
+      expect(completionPairs).toContainEqual({
+        taskId: 'B',
+        workerId: 'worker-B',
+        success: true,
+      });
+    });
+
     test('retryConflictResolution processes pending conflicts in FIFO order', async () => {
       const tracker = createMockTracker();
       const completedTaskIds: string[] = [];

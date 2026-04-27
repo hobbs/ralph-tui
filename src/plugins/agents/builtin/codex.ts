@@ -123,6 +123,7 @@ export class CodexAgentPlugin extends BaseAgentPlugin {
   };
 
   private model?: string;
+  private modelEffort?: string;
   private fullAuto = true;
   private sandbox: 'read-only' | 'workspace-write' | 'danger-full-access' = 'workspace-write';
   protected override defaultTimeout = 0;
@@ -132,6 +133,10 @@ export class CodexAgentPlugin extends BaseAgentPlugin {
 
     if (typeof config.model === 'string' && config.model.length > 0) {
       this.model = config.model;
+    }
+
+    if (typeof config.modelEffort === 'string' && config.modelEffort.length > 0) {
+      this.modelEffort = config.modelEffort;
     }
 
     if (typeof config.fullAuto === 'boolean') {
@@ -261,6 +266,21 @@ export class CodexAgentPlugin extends BaseAgentPlugin {
         help: 'OpenAI model to use (leave empty for default)',
       },
       {
+        id: 'modelEffort',
+        prompt: 'Model effort level:',
+        type: 'select',
+        choices: [
+          { value: '', label: 'Default', description: 'Use Codex default effort' },
+          { value: 'minimal', label: 'Minimal', description: 'Lowest reasoning effort' },
+          { value: 'low', label: 'Low', description: 'Light reasoning effort' },
+          { value: 'medium', label: 'Medium', description: 'Balanced reasoning effort' },
+          { value: 'high', label: 'High', description: 'Deep reasoning effort' },
+        ],
+        default: '',
+        required: false,
+        help: 'Reasoning effort for supported models',
+      },
+      {
         id: 'fullAuto',
         prompt: 'Enable full-auto mode?',
         type: 'boolean',
@@ -313,6 +333,11 @@ export class CodexAgentPlugin extends BaseAgentPlugin {
     // Model selection
     if (this.model) {
       args.push('--model', this.model);
+    }
+
+    // Model effort / reasoning level
+    if (this.modelEffort) {
+      args.push('--config', `model_reasoning_effort=${this.modelEffort}`);
     }
 
     // Sandbox mode

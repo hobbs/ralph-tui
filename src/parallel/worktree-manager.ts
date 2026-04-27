@@ -140,7 +140,9 @@ export class WorktreeManager {
     await this.cleanupStaleWorktree(worktreePath, branchName);
 
     // Create the worktree with a new branch from HEAD
-    this.git(['worktree', 'add', '-b', branchName, worktreePath, 'HEAD']);
+    // If git reports a stale "already exists/already checked out" state,
+    // attempt one cleanup-and-retry cycle before failing.
+    this.createWorktreeWithRecovery(worktreePath, branchName);
 
     // Copy ralph-tui config into the worktree so the agent has project context
     await this.copyConfig(worktreePath);
@@ -369,6 +371,71 @@ export class WorktreeManager {
     } catch {
       // Branch may not exist
     }
+  }
+
+  /**
+   * Create a worktree and recover once from stale "already exists" errors.
+   */
+  private createWorktreeWithRecovery(
+    worktreePath: string,
+    branchName: string
+  ): void {
+    try {
+      this.git(['worktree', 'add', '-b', branchName, worktreePath, 'HEAD']);
+      return;
+    } catch (error) {
+      if (!this.isRecoverableWorktreeExistsError(error)) {
+        throw error;
+      }
+    }
+
+    this.forceRemoveWorktreeReference(worktreePath);
+
+    // Ensure branch can be recreated after recovering from stale state.
+    try {
+      this.git(['branch', '-D', branchName]);
+    } catch {
+      // Branch may not exist.
+    }
+
+    this.git(['worktree', 'add', '-b', branchName, worktreePath, 'HEAD']);
+  }
+
+  /**
+   * Remove stale worktree metadata and on-disk state for a path.
+   */
+  private forceRemoveWorktreeReference(worktreePath: string): void {
+    try {
+      this.git(['worktree', 'remove', '--force', worktreePath]);
+    } catch {
+      // Worktree may be missing on disk but still registered; prune handles that.
+    }
+
+    if (fs.existsSync(worktreePath)) {
+      fs.rmSync(worktreePath, { recursive: true, force: true });
+    }
+
+    try {
+      this.git(['worktree', 'prune']);
+    } catch {
+      // Best effort.
+    }
+  }
+
+  /**
+   * Detect recoverable git worktree errors caused by stale registration.
+   */
+  private isRecoverableWorktreeExistsError(error: unknown): boolean {
+    if (!(error instanceof Error)) {
+      return false;
+    }
+
+    const message = error.message.toLowerCase();
+    return (
+      message.includes('already exists') ||
+      message.includes('already checked out') ||
+      message.includes('is a missing but already registered worktree')
+    );
   }
 
   /**

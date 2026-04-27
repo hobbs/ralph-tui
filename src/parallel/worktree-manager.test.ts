@@ -219,6 +219,28 @@ describe('WorktreeManager', () => {
       const info2 = await newManager.acquire('w1', 'task-001');
       expect(fs.existsSync(info2.path)).toBe(true);
     });
+
+    test('recovers when git metadata says worktree already exists but directory is missing', async () => {
+      const first = await manager.acquire('w1', 'task-001');
+      const originalPath = first.path;
+      const originalBranch = first.branch;
+
+      // Simulate a stale registration: remove files but keep git metadata.
+      fs.rmSync(originalPath, { recursive: true, force: true });
+
+      // Confirm the stale worktree is still listed by git.
+      const listBefore = git(repoDir, 'worktree list --porcelain');
+      expect(listBefore).toContain(originalPath);
+
+      // Release internal slot so we can reacquire with the same worker id/path.
+      manager.release(first.id);
+
+      // acquire() should recover by pruning/removing stale state and retrying.
+      const recovered = await manager.acquire('w1', 'task-001');
+      expect(fs.existsSync(recovered.path)).toBe(true);
+      expect(recovered.path).toBe(originalPath);
+      expect(recovered.branch).toBe(originalBranch);
+    });
   });
 
   describe('release', () => {

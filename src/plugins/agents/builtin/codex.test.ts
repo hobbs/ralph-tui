@@ -68,6 +68,11 @@ describe('CodexAgentPlugin', () => {
       expect(await plugin.isReady()).toBe(true);
     });
 
+    test('accepts model effort configuration', async () => {
+      await plugin.initialize({ modelEffort: 'high' });
+      expect(await plugin.isReady()).toBe(true);
+    });
+
     test('accepts fullAuto configuration', async () => {
       await plugin.initialize({ fullAuto: false });
       expect(await plugin.isReady()).toBe(true);
@@ -110,6 +115,14 @@ describe('CodexAgentPlugin', () => {
       const modelQuestion = questions.find((q) => q.id === 'model');
       expect(modelQuestion).toBeDefined();
       expect(modelQuestion?.type).toBe('text');
+    });
+
+    test('includes model effort question', () => {
+      const questions = plugin.getSetupQuestions();
+      const modelEffortQuestion = questions.find((q) => q.id === 'modelEffort');
+      expect(modelEffortQuestion).toBeDefined();
+      expect(modelEffortQuestion?.type).toBe('select');
+      expect(modelEffortQuestion?.choices?.length).toBeGreaterThan(0);
     });
 
     test('includes fullAuto question', () => {
@@ -232,6 +245,13 @@ describe('CodexAgentPlugin buildArgs', () => {
     const args = (plugin as TestableCodexPlugin).testBuildArgs('test prompt');
     expect(args).toContain('--model');
     expect(args).toContain('gpt-4o');
+  });
+
+  test('includes model effort config when specified', async () => {
+    await plugin.initialize({ modelEffort: 'high' });
+    const args = (plugin as TestableCodexPlugin).testBuildArgs('test prompt');
+    expect(args).toContain('--config');
+    expect(args).toContain('model_reasoning_effort=high');
   });
 
   test('includes sandbox mode', async () => {

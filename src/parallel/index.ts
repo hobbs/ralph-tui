@@ -639,24 +639,20 @@ export class ParallelExecutor {
     }
   ): Promise<void> {
     if (this.shouldStop) {
-      counters.incrementTaskFailed();
-      this.totalTasksFailed++;
-      await this.resetTaskToOpen(result.task.id);
+      await this.finalizeTaskAsFailed(result, counters);
       return;
     }
 
     if (!(result.success && result.taskCompleted)) {
-      counters.incrementTaskFailed();
-      this.totalTasksFailed++;
-      await this.resetTaskToOpen(result.task.id);
+      await this.finalizeTaskAsFailed(result, counters);
       return;
     }
 
     this.status = 'merging';
 
     const savedState = await this.saveTrackerState();
+    const operation = this.mergeEngine.enqueue(result);
     let mergeResult: Awaited<ReturnType<typeof this.mergeEngine.processNext>>;
-    this.mergeEngine.enqueue(result);
     try {
       mergeResult = await this.mergeEngine.processNext();
     } finally {
@@ -680,20 +676,13 @@ export class ParallelExecutor {
     }
 
     if (mergeResult?.hadConflicts) {
-      const operation = this.mergeEngine
-        .getQueue()
-        .find((op) => op.id === mergeResult.operationId);
-
       if (operation && this.config.aiConflictResolution) {
         if (this.shouldStop) {
-          counters.incrementTaskFailed();
-          this.totalTasksFailed++;
-          counters.incrementMergeFailed();
           this.markConflictOperationRolledBack(
             operation.id,
             'Parallel execution stopped before conflict resolution'
           );
-          await this.resetTaskToOpen(result.task.id);
+          await this.finalizeTaskAsFailed(result, counters, true);
           return;
         }
 
@@ -727,13 +716,6 @@ export class ParallelExecutor {
         const requeued = await this.handleMergeFailure(result, operation);
         if (requeued) {
           this.enqueueRetryTasks(pendingTasks, [result.task]);
-          this.emitParallel({
-            type: 'conflict:resolved',
-            timestamp: new Date().toISOString(),
-            operationId: operation.id,
-            taskId: result.task.id,
-            results: [],
-          });
           this.status = 'executing';
           return;
         }
@@ -767,6 +749,25 @@ export class ParallelExecutor {
       counters.incrementMergeFailed();
     }
     this.status = 'executing';
+  }
+
+  /**
+   * Finalize a failed task by resetting tracker status and counters.
+   */
+  private async finalizeTaskAsFailed(
+    result: WorkerResult,
+    counters: {
+      incrementTaskFailed: () => void;
+      incrementMergeFailed?: () => void;
+    },
+    isMergeFailure = false
+  ): Promise<void> {
+    counters.incrementTaskFailed();
+    this.totalTasksFailed++;
+    if (isMergeFailure) {
+      counters.incrementMergeFailed?.();
+    }
+    await this.resetTaskToOpen(result.task.id);
   }
 
   /**

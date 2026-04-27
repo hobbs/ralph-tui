@@ -52,12 +52,10 @@ interface PendingConflictEntry {
  * 1. Fetch all tasks from the tracker
  * 2. Run TaskGraphAnalysis to find parallel groups
  * 3. For each group (in topological order):
- *    a. Acquire worktrees (up to maxWorkers per batch)
- *    b. Create + start workers (one per task)
- *    c. Wait for all workers in the group to complete
- *    d. Merge completed workers via merge queue (sequential)
- *    e. Handle merge conflicts (rollback + re-queue if needed)
- *    f. Release worktrees
+ *    a. Start up to maxWorkers workers from a FIFO pending queue
+ *    b. When a worker finishes, run merge/conflict post-processing immediately
+ *    c. Refill the freed worker slot with the next pending task
+ *    d. Continue until both pending and in-flight workers are empty
  * 4. After all groups: cleanup all worktrees, emit completion
  */
 export class ParallelExecutor {
@@ -85,6 +83,7 @@ export class ParallelExecutor {
   private statusBeforePause: ParallelExecutorStatus | null = null;
   private pauseWaiters: Array<() => void> = [];
   private returnToOriginalBranchError: string | null = null;
+  private workerLaunchCount = 0;
 
   private readonly parallelListeners: ParallelEventListener[] = [];
   private readonly engineListeners: EngineEventListener[] = [];
@@ -267,6 +266,7 @@ export class ParallelExecutor {
     this.pendingConflicts = [];
     this.preservedRecoveryWorktrees = [];
     this.returnToOriginalBranchError = null;
+    this.workerLaunchCount = 0;
   }
 
   /**
@@ -511,191 +511,60 @@ export class ParallelExecutor {
       workerCount: Math.min(group.tasks.length, this.config.maxWorkers),
     });
 
-    // Process tasks in batches, allowing failed merges to be re-queued.
     const pendingTasks = [...group.tasks];
+    const inFlightWorkers = new Map<number, Promise<{ slotIndex: number; result: WorkerResult }>>();
     let groupTasksCompleted = 0;
     let groupTasksFailed = 0;
     let groupMergesCompleted = 0;
     let groupMergesFailed = 0;
 
-    while (pendingTasks.length > 0) {
-      if (this.shouldStop) break;
+    const launchWorkerInSlot = async (slotIndex: number): Promise<boolean> => {
       await this.waitWhilePaused();
-      if (this.shouldStop) break;
+      if (this.shouldStop) {
+        return false;
+      }
 
-      const [batch] = this.batchTasks(pendingTasks);
-      if (!batch || batch.length === 0) {
+      const nextTask = pendingTasks.shift();
+      if (!nextTask) {
+        return false;
+      }
+
+      const startedWorker = await this.startWorkerForTask(nextTask, slotIndex);
+      inFlightWorkers.set(slotIndex, startedWorker.resultPromise);
+      return true;
+    };
+
+    const initialWorkerCount = Math.min(this.config.maxWorkers, pendingTasks.length);
+    for (let slotIndex = 0; slotIndex < initialWorkerCount; slotIndex++) {
+      const started = await launchWorkerInSlot(slotIndex);
+      if (!started) {
         break;
       }
-      pendingTasks.splice(0, batch.length);
+    }
 
-      // Execute batch of workers in parallel
-      const results = await this.executeBatch(batch);
+    while (inFlightWorkers.size > 0) {
+      const completed = await Promise.race(inFlightWorkers.values());
+      inFlightWorkers.delete(completed.slotIndex);
+      this.activeWorkers = this.activeWorkers.filter((w) => w.id !== completed.result.workerId);
+      this.worktreeManager.release(`worker-${completed.result.workerId}`);
+      this.completedResults.push(completed.result);
 
-      // Phase 1: Attempt all merges first, collect conflicts
-      this.status = 'merging';
-      const retryTasks: TrackerTask[] = [];
-      const pendingConflicts: Array<{
-        operation: MergeOperation;
-        workerResult: WorkerResult;
-      }> = [];
-
-      for (const result of results) {
-        if (this.shouldStop) {
-          // Stop was requested mid-batch: do not merge partial work, reopen task instead.
+      await this.handleWorkerCompletion(completed.result, pendingTasks, {
+        incrementTaskCompleted: () => {
+          groupTasksCompleted++;
+        },
+        incrementTaskFailed: () => {
           groupTasksFailed++;
-          this.totalTasksFailed++;
-          await this.resetTaskToOpen(result.task.id);
-          continue;
-        }
+        },
+        incrementMergeCompleted: () => {
+          groupMergesCompleted++;
+        },
+        incrementMergeFailed: () => {
+          groupMergesFailed++;
+        },
+      });
 
-        if (result.success && result.taskCompleted) {
-          // Save tracker state before merge to prevent worktree's stale copy from overwriting
-          const savedState = await this.saveTrackerState();
-
-          // Enqueue and process merge (wrapped in try/finally to guarantee restore)
-          let mergeResult: Awaited<ReturnType<typeof this.mergeEngine.processNext>>;
-          this.mergeEngine.enqueue(result);
-          try {
-            mergeResult = await this.mergeEngine.processNext();
-          } finally {
-            // Restore tracker state after merge to preserve task completion status
-            await this.restoreTrackerState(savedState);
-          }
-
-          if (mergeResult?.success) {
-            // Merge succeeded - mark task as complete in tracker
-            try {
-              await this.tracker.completeTask(result.task.id);
-            } catch {
-              // Log but don't fail after successful merge
-            }
-            // Merge worker's progress.md into main so subsequent workers see learnings
-            await this.mergeProgressFile(result);
-            this.requeueCounts.delete(result.task.id);
-            groupTasksCompleted++;
-            this.totalTasksCompleted++;
-            groupMergesCompleted++;
-            this.totalMergesCompleted++;
-          } else if (mergeResult?.hadConflicts) {
-            // Collect conflict for later resolution (don't resolve yet)
-            const operation = this.mergeEngine
-              .getQueue()
-              .find((op) => op.id === mergeResult.operationId);
-
-            if (operation && this.config.aiConflictResolution) {
-              pendingConflicts.push({ operation, workerResult: result });
-            } else {
-              // AI conflict resolution disabled - requeue/fail based on retry budget.
-              const requeued = await this.handleMergeFailure(result, operation);
-              if (requeued) {
-                retryTasks.push(result.task);
-              } else {
-                groupTasksFailed++;
-                this.totalTasksFailed++;
-                groupMergesFailed++;
-              }
-            }
-          } else {
-            // Merge failed (non-conflict) - requeue/fail based on retry budget.
-            const requeued = await this.handleMergeFailure(result);
-            if (requeued) {
-              retryTasks.push(result.task);
-            } else {
-              groupTasksFailed++;
-              this.totalTasksFailed++;
-              groupMergesFailed++;
-            }
-          }
-        } else {
-          groupTasksFailed++;
-          this.totalTasksFailed++;
-          await this.resetTaskToOpen(result.task.id);
-        }
-      }
-
-      // Phase 2: Resolve all collected conflicts after all merges attempted
-      if (pendingConflicts.length > 0) {
-        if (this.shouldStop) {
-          for (const { operation, workerResult } of pendingConflicts) {
-            groupTasksFailed++;
-            this.totalTasksFailed++;
-            groupMergesFailed++;
-            this.markConflictOperationRolledBack(
-              operation.id,
-              'Parallel execution stopped before conflict resolution'
-            );
-            await this.resetTaskToOpen(workerResult.task.id);
-          }
-          continue;
-        }
-
-        for (const { operation, workerResult } of pendingConflicts) {
-          if (this.shouldStop) {
-            groupTasksFailed++;
-            this.totalTasksFailed++;
-            groupMergesFailed++;
-            this.markConflictOperationRolledBack(
-              operation.id,
-              'Parallel execution stopped before conflict resolution'
-            );
-            await this.resetTaskToOpen(workerResult.task.id);
-            continue;
-          }
-
-          // Save tracker state before conflict resolution
-          const savedState = await this.saveTrackerState();
-
-          // Resolve conflicts (wrapped in try/finally to guarantee restore)
-          let resolutions: Awaited<ReturnType<typeof this.conflictResolver.resolveConflicts>>;
-          let allResolved: boolean;
-          try {
-            resolutions = await this.conflictResolver.resolveConflicts(operation);
-            allResolved = resolutions.every((r) => r.success);
-          } finally {
-            // Restore tracker state after conflict resolution
-            await this.restoreTrackerState(savedState);
-          }
-
-          if (allResolved) {
-            // Conflict resolution succeeded - mark task as complete
-            try {
-              await this.tracker.completeTask(workerResult.task.id);
-            } catch {
-              // Log but don't fail after successful resolution
-            }
-            // Merge worker's progress.md into main
-            await this.mergeProgressFile(workerResult);
-            this.requeueCounts.delete(workerResult.task.id);
-            this.totalConflictsResolved += resolutions.length;
-            groupTasksCompleted++;
-            this.totalTasksCompleted++;
-            groupMergesCompleted++;
-            this.totalMergesCompleted++;
-          } else {
-            // Conflict resolution failed - requeue first, then track as pending only
-            // if retries are exhausted so the conflict queue reflects actionable items.
-            const requeued = await this.handleMergeFailure(workerResult, operation);
-            if (requeued) {
-              retryTasks.push(workerResult.task);
-              this.emitParallel({
-                type: 'conflict:resolved',
-                timestamp: new Date().toISOString(),
-                operationId: operation.id,
-                taskId: workerResult.task.id,
-                results: [],
-              });
-            } else {
-              this.enqueuePendingConflict(operation, workerResult);
-              groupTasksFailed++;
-              this.totalTasksFailed++;
-              groupMergesFailed++;
-            }
-          }
-        }
-      }
-
-      this.enqueueRetryTasks(pendingTasks, retryTasks);
+      await launchWorkerInSlot(completed.slotIndex);
     }
 
     this.emitParallel({
@@ -711,98 +580,193 @@ export class ParallelExecutor {
   }
 
   /**
-   * Execute a batch of tasks in parallel using workers.
+   * Start a worker for the provided task in a fixed slot.
    */
-  private async executeBatch(tasks: TrackerTask[]): Promise<WorkerResult[]> {
-    this.activeWorkers = [];
+  private async startWorkerForTask(
+    task: TrackerTask,
+    slotIndex: number
+  ): Promise<{ resultPromise: Promise<{ slotIndex: number; result: WorkerResult }> }> {
+    const workerId = `w${this.currentGroupIndex}-${slotIndex}-${this.workerLaunchCount++}`;
 
-    // Create workers
-    // Track branch names from worktree acquisition for failure result construction
-    const branchNames: string[] = [];
-
-    for (let i = 0; i < tasks.length; i++) {
-      const task = tasks[i];
-      const workerId = `w${this.currentGroupIndex}-${i}`;
-
-      // Acquire worktree - use the sanitized branch name returned by acquire()
-      // since acquire() sanitizes task IDs into valid git branch names
-      const worktreeInfo = await this.worktreeManager.acquire(
-        workerId,
-        task.id
-      );
-      branchNames.push(worktreeInfo.branch);
-
-      const worker = new Worker(
-        {
-          id: workerId,
-          task,
-          worktreePath: worktreeInfo.path,
-          branchName: worktreeInfo.branch,
-          cwd: this.config.cwd,
-        },
-        this.config.maxIterationsPerWorker
-      );
-
-      // Forward worker events
-      worker.on((event) => this.emitParallel(event));
-      worker.onEngineEvent((event) => {
-        for (const listener of this.engineListeners) {
-          try {
-            listener(event);
-          } catch {
-            // Don't let listener errors propagate
-          }
-        }
-      });
-
-      // Initialize the worker engine with the shared tracker
-      await worker.initialize(this.baseConfig, this.tracker);
-      this.activeWorkers.push(worker);
-
-      // Mark task as in_progress in the tracker
-      try {
-        await this.tracker.updateTaskStatus(task.id, 'in_progress');
-      } catch {
-        // Non-fatal — tracker update may fail for some trackers
-      }
-    }
-
-    // Start all workers in parallel
-    const workerPromises = this.activeWorkers.map((w) => w.start());
-    const results = await Promise.allSettled(workerPromises);
-
-    // Collect results
-    const workerResults: WorkerResult[] = results.map((result, i) => {
-      if (result.status === 'fulfilled') {
-        return result.value;
-      }
-      // Worker promise rejected — create a failure result
-      const task = tasks[i];
-      return {
-        workerId: this.activeWorkers[i].id,
+    const worktreeInfo = await this.worktreeManager.acquire(workerId, task.id);
+    const worker = new Worker(
+      {
+        id: workerId,
         task,
-        success: false,
-        iterationsRun: 0,
-        taskCompleted: false,
-        durationMs: 0,
-        error:
-          result.reason instanceof Error
-            ? result.reason.message
-            : String(result.reason),
-        branchName: branchNames[i],
-        commitCount: 0,
-      };
+        worktreePath: worktreeInfo.path,
+        branchName: worktreeInfo.branch,
+        cwd: this.config.cwd,
+      },
+      this.config.maxIterationsPerWorker
+    );
+
+    worker.on((event) => this.emitParallel(event));
+    worker.onEngineEvent((event) => {
+      for (const listener of this.engineListeners) {
+        try {
+          listener(event);
+        } catch {
+          // Don't let listener errors propagate
+        }
+      }
     });
 
-    // Release worktrees (use "worker-" prefix to match acquire's worktreeId format)
-    for (const worker of this.activeWorkers) {
-      this.worktreeManager.release(`worker-${worker.id}`);
+    await worker.initialize(this.baseConfig, this.tracker);
+    this.activeWorkers.push(worker);
+
+    try {
+      await this.tracker.updateTaskStatus(task.id, 'in_progress');
+    } catch {
+      // Non-fatal — tracker update may fail for some trackers
     }
 
-    this.completedResults.push(...workerResults);
-    this.activeWorkers = [];
+    const resultPromise = worker.start().then((result) => ({ slotIndex, result }));
 
-    return workerResults;
+    return { resultPromise };
+  }
+
+  /**
+   * Handle completion pipeline for an individual worker.
+   */
+  private async handleWorkerCompletion(
+    result: WorkerResult,
+    pendingTasks: TrackerTask[],
+    counters: {
+      incrementTaskCompleted: () => void;
+      incrementTaskFailed: () => void;
+      incrementMergeCompleted: () => void;
+      incrementMergeFailed: () => void;
+    }
+  ): Promise<void> {
+    if (this.shouldStop) {
+      counters.incrementTaskFailed();
+      this.totalTasksFailed++;
+      await this.resetTaskToOpen(result.task.id);
+      return;
+    }
+
+    if (!(result.success && result.taskCompleted)) {
+      counters.incrementTaskFailed();
+      this.totalTasksFailed++;
+      await this.resetTaskToOpen(result.task.id);
+      return;
+    }
+
+    this.status = 'merging';
+
+    const savedState = await this.saveTrackerState();
+    let mergeResult: Awaited<ReturnType<typeof this.mergeEngine.processNext>>;
+    this.mergeEngine.enqueue(result);
+    try {
+      mergeResult = await this.mergeEngine.processNext();
+    } finally {
+      await this.restoreTrackerState(savedState);
+    }
+
+    if (mergeResult?.success) {
+      try {
+        await this.tracker.completeTask(result.task.id);
+      } catch {
+        // Log but don't fail after successful merge
+      }
+      await this.mergeProgressFile(result);
+      this.requeueCounts.delete(result.task.id);
+      counters.incrementTaskCompleted();
+      this.totalTasksCompleted++;
+      counters.incrementMergeCompleted();
+      this.totalMergesCompleted++;
+      this.status = 'executing';
+      return;
+    }
+
+    if (mergeResult?.hadConflicts) {
+      const operation = this.mergeEngine
+        .getQueue()
+        .find((op) => op.id === mergeResult.operationId);
+
+      if (operation && this.config.aiConflictResolution) {
+        if (this.shouldStop) {
+          counters.incrementTaskFailed();
+          this.totalTasksFailed++;
+          counters.incrementMergeFailed();
+          this.markConflictOperationRolledBack(
+            operation.id,
+            'Parallel execution stopped before conflict resolution'
+          );
+          await this.resetTaskToOpen(result.task.id);
+          return;
+        }
+
+        const savedConflictState = await this.saveTrackerState();
+        let resolutions: Awaited<ReturnType<typeof this.conflictResolver.resolveConflicts>>;
+        let allResolved = false;
+        try {
+          resolutions = await this.conflictResolver.resolveConflicts(operation);
+          allResolved = resolutions.every((r) => r.success);
+        } finally {
+          await this.restoreTrackerState(savedConflictState);
+        }
+
+        if (allResolved) {
+          try {
+            await this.tracker.completeTask(result.task.id);
+          } catch {
+            // Log but don't fail after successful resolution
+          }
+          await this.mergeProgressFile(result);
+          this.requeueCounts.delete(result.task.id);
+          this.totalConflictsResolved += resolutions.length;
+          counters.incrementTaskCompleted();
+          this.totalTasksCompleted++;
+          counters.incrementMergeCompleted();
+          this.totalMergesCompleted++;
+          this.status = 'executing';
+          return;
+        }
+
+        const requeued = await this.handleMergeFailure(result, operation);
+        if (requeued) {
+          this.enqueueRetryTasks(pendingTasks, [result.task]);
+          this.emitParallel({
+            type: 'conflict:resolved',
+            timestamp: new Date().toISOString(),
+            operationId: operation.id,
+            taskId: result.task.id,
+            results: [],
+          });
+          this.status = 'executing';
+          return;
+        }
+
+        this.enqueuePendingConflict(operation, result);
+        counters.incrementTaskFailed();
+        this.totalTasksFailed++;
+        counters.incrementMergeFailed();
+        this.status = 'executing';
+        return;
+      }
+
+      const requeued = await this.handleMergeFailure(result, operation);
+      if (requeued) {
+        this.enqueueRetryTasks(pendingTasks, [result.task]);
+      } else {
+        counters.incrementTaskFailed();
+        this.totalTasksFailed++;
+        counters.incrementMergeFailed();
+      }
+      this.status = 'executing';
+      return;
+    }
+
+    const requeued = await this.handleMergeFailure(result);
+    if (requeued) {
+      this.enqueueRetryTasks(pendingTasks, [result.task]);
+    } else {
+      counters.incrementTaskFailed();
+      this.totalTasksFailed++;
+      counters.incrementMergeFailed();
+    }
+    this.status = 'executing';
   }
 
   /**
@@ -842,17 +806,6 @@ export class ParallelExecutor {
     } catch {
       // Best effort
     }
-  }
-
-  /**
-   * Split tasks into batches of maxWorkers size.
-   */
-  private batchTasks(tasks: TrackerTask[]): TrackerTask[][] {
-    const batches: TrackerTask[][] = [];
-    for (let i = 0; i < tasks.length; i += this.config.maxWorkers) {
-      batches.push(tasks.slice(i, i + this.config.maxWorkers));
-    }
-    return batches;
   }
 
   /**

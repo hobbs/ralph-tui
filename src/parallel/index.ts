@@ -45,6 +45,8 @@ interface PendingConflictEntry {
   workerResult: WorkerResult;
 }
 
+type ConflictResolutions = Awaited<ReturnType<ConflictResolver['resolveConflicts']>>;
+
 /**
  * Coordinates parallel execution of independent tasks using git worktrees.
  *
@@ -702,7 +704,7 @@ export class ParallelExecutor {
         }
 
         const savedConflictState = await this.saveTrackerState();
-        let resolutions: Awaited<ReturnType<typeof this.conflictResolver.resolveConflicts>>;
+        let resolutions: ConflictResolutions;
         let allResolved = false;
         try {
           resolutions = await this.conflictResolver.resolveConflicts(operation);
